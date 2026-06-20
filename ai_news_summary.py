@@ -23,7 +23,6 @@ import html
 import os
 import re
 import sys
-import textwrap
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -158,8 +157,29 @@ def collect_articles(days: int) -> list[Article]:
 # 요약
 # ---------------------------------------------------------------------------
 
+def build_summary_prompt(articles: list[Article]) -> str:
+    """LLM(또는 Codex)에 보낼 한국어 요약 프롬프트를 만든다(상위 30건)."""
+    lines = []
+    for i, a in enumerate(articles[:30], 1):
+        lines.append(f"[{i}] {a.title} ({a.source}, {a.published_str})\n    {a.summary}")
+    article_block = "\n".join(lines)
+
+    instructions = (
+        "아래는 'AI 신뢰성·안정성 인증 및 평가'와 관련해 오늘 수집한 뉴스 기사 목록입니다.\n"
+        "이 내용을 바탕으로 한국어 일일 브리핑을 작성해 주세요.\n"
+        "설명·서두 없이 곧바로 브리핑 본문(Markdown)만 출력하세요.\n\n"
+        "작성 형식:\n"
+        "1. **오늘의 핵심 요약** — 전체 흐름을 3~5문장으로 정리\n"
+        "2. **주요 토픽별 정리** — 관련 기사를 2~4개 주제로 묶어 각 주제를 불릿으로 요약\n"
+        "   (각 항목 끝에 참고한 기사 번호를 [n] 형태로 표기)\n"
+        "3. **주목할 동향/시사점** — 인증·평가·규제 관점에서 눈여겨볼 점 2~3가지\n\n"
+        "과장 없이 사실 위주로, 기사에 없는 내용은 추측하지 마세요.\n"
+    )
+    return f"{instructions}\n===== 기사 목록 =====\n{article_block}\n"
+
+
 def summarize_with_claude(articles: list[Article]) -> str | None:
-    """Claude로 한국어 요약 리포트를 생성한다. 실패/키 없음이면 None."""
+    """Claude(API 키)로 한국어 요약 리포트를 생성한다. 실패/키 없음이면 None."""
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return None
     try:
@@ -169,35 +189,13 @@ def summarize_with_claude(articles: list[Article]) -> str | None:
               file=sys.stderr)
         return None
 
-    # 기사 목록을 프롬프트로 구성(토큰 절약을 위해 상위 30건)
-    lines = []
-    for i, a in enumerate(articles[:30], 1):
-        lines.append(f"[{i}] {a.title} ({a.source}, {a.published_str})\n    {a.summary}")
-    article_block = "\n".join(lines)
-
-    prompt = textwrap.dedent(f"""\
-        아래는 'AI 신뢰성·안정성 인증 및 평가'와 관련해 오늘 수집한 뉴스 기사 목록입니다.
-        이 내용을 바탕으로 한국어 일일 브리핑을 작성해 주세요.
-
-        작성 형식:
-        1. **오늘의 핵심 요약** — 전체 흐름을 3~5문장으로 정리
-        2. **주요 토픽별 정리** — 관련 기사를 2~4개 주제로 묶어 각 주제를 불릿으로 요약
-           (각 항목 끝에 참고한 기사 번호를 [n] 형태로 표기)
-        3. **주목할 동향/시사점** — 인증·평가·규제 관점에서 눈여겨볼 점 2~3가지
-
-        과장 없이 사실 위주로, 기사에 없는 내용은 추측하지 마세요.
-
-        ===== 기사 목록 =====
-        {article_block}
-        """)
-
     client = anthropic.Anthropic()
     try:
         with client.messages.stream(
             model=MODEL,
             max_tokens=4000,
             thinking={"type": "adaptive"},
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": build_summary_prompt(articles)}],
         ) as stream:
             message = stream.get_final_message()
     except Exception as exc:
@@ -205,6 +203,57 @@ def summarize_with_claude(articles: list[Article]) -> str | None:
         return None
 
     return "".join(b.text for b in message.content if b.type == "text").strip()
+
+
+def summarize_with_codex(articles: list[Article]) -> str | None:
+    """OpenAI Codex CLI(ChatGPT 구독 OAuth 로그인)로 요약한다. 실패/미설치면 None.
+
+    Codex CLI는 'Sign in with ChatGPT'(OAuth)로 로그인하면 Plus/Pro 구독
+    사용량으로 동작하므로 별도 API 키가 필요 없습니다.
+    호출 명령은 CODEX_CMD 환경변수로 바꿀 수 있습니다(기본: 'codex exec').
+    """
+    import shlex
+    import subprocess
+
+    cmd_prefix = shlex.split(os.environ.get("CODEX_CMD", "codex exec"))
+    prompt = build_summary_prompt(articles)
+
+    try:
+        proc = subprocess.run(
+            cmd_prefix + [prompt],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except FileNotFoundError:
+        print("  ! Codex CLI를 찾을 수 없습니다. 설치 후 'codex' 로그인을 확인하세요.\n"
+              "    (npm i -g @openai/codex  →  codex 로 ChatGPT 로그인)",
+              file=sys.stderr)
+        return None
+    except subprocess.TimeoutExpired:
+        print("  ! Codex 요약이 시간 초과되었습니다.", file=sys.stderr)
+        return None
+
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        print(f"  ! Codex 요약 실패(코드 {proc.returncode}). 폴백으로 전환합니다.\n"
+              f"    {err[:300]}\n"
+              "    명령을 바꾸려면 CODEX_CMD 환경변수를 조정하세요. "
+              "예) export CODEX_CMD='codex exec --skip-git-repo-check'",
+              file=sys.stderr)
+        return None
+
+    out = (proc.stdout or "").strip()
+    return out or None
+
+
+def make_chatgpt_prompt_file(articles: list[Article]) -> str:
+    """ChatGPT 웹에 붙여넣을 프롬프트를 파일로 저장하고 경로를 돌려준다."""
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    path = os.path.join(REPORT_DIR, f"chatgpt-prompt-{dt.date.today().isoformat()}.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(build_summary_prompt(articles))
+    return path
 
 
 def fallback_digest(articles: list[Article]) -> str:
@@ -225,14 +274,13 @@ def fallback_digest(articles: list[Article]) -> str:
 # 리포트 출력
 # ---------------------------------------------------------------------------
 
-def build_report(articles: list[Article], body: str, used_claude: bool) -> str:
+def build_report(articles: list[Article], body: str, engine_label: str) -> str:
     today = dt.date.today().isoformat()
-    engine = "Claude 요약" if used_claude else "자동 정리(폴백)"
     header = (
         f"# AI 신뢰성·안정성 인증 및 평가 — 일일 뉴스 브리핑\n\n"
         f"- 생성일: {today}\n"
         f"- 수집 기사 수: {len(articles)}건\n"
-        f"- 요약 엔진: {engine}\n"
+        f"- 요약 엔진: {engine_label}\n"
     )
     sources = "\n".join(
         f"{i}. [{a.title}]({a.link}) — {a.source or '미상'} ({a.published_str})"
@@ -258,6 +306,13 @@ def main() -> int:
         description="AI 신뢰성·안정성 인증/평가 관련 뉴스 일일 요약")
     parser.add_argument("--days", type=int, default=2,
                         help="최근 며칠 이내의 기사만 수집 (기본: 2)")
+    parser.add_argument("--engine", choices=["auto", "claude", "codex", "none"],
+                        default="auto",
+                        help="요약 엔진 선택 (auto: 키/CLI 자동 감지, "
+                             "claude: Anthropic API, codex: ChatGPT 구독 CLI, "
+                             "none: 오프라인 자동 정리)")
+    parser.add_argument("--chatgpt-prompt", action="store_true",
+                        help="요약 대신, ChatGPT 웹에 붙여넣을 프롬프트 파일만 생성")
     parser.add_argument("--no-save", action="store_true",
                         help="Markdown 파일로 저장하지 않음")
     args = parser.parse_args()
@@ -269,14 +324,30 @@ def main() -> int:
         return 1
     print(f"      → {len(articles)}건 수집 완료")
 
+    # ChatGPT Plus 반자동 모드: 프롬프트 파일만 만들고 종료
+    if args.chatgpt_prompt:
+        path = make_chatgpt_prompt_file(articles)
+        print(f"\nChatGPT에 붙여넣을 프롬프트를 만들었습니다: {path}")
+        print("→ 파일 내용을 복사해 ChatGPT(chatgpt.com) 대화창에 붙여넣으면 요약을 받을 수 있어요.")
+        return 0
+
     print("[2/3] 요약 생성 중...")
-    body = summarize_with_claude(articles)
-    used_claude = body is not None
-    if not used_claude:
+    body = None
+    engine_label = "자동 정리(폴백)"
+
+    if args.engine in ("auto", "claude"):
+        body = summarize_with_claude(articles)
+        if body:
+            engine_label = "Claude 요약"
+    if body is None and args.engine in ("auto", "codex"):
+        body = summarize_with_codex(articles)
+        if body:
+            engine_label = "Codex(ChatGPT 구독) 요약"
+    if body is None:
         body = fallback_digest(articles)
 
     print("[3/3] 리포트 작성 중...")
-    report = build_report(articles, body, used_claude)
+    report = build_report(articles, body, engine_label)
 
     print("\n" + "=" * 70)
     print(report)
